@@ -1,0 +1,6 @@
+{
+  "name": "PATCH.EXE",
+  "description": "AI가 플레이어를 분석하고 게임 규칙을 계속 수정하는 2D 탑다운 액션 로그라이트 게임",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
