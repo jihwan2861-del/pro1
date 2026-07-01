@@ -6,6 +6,8 @@ export interface GameStats {
   dashCount: number;
   timeElapsed: number; // in seconds
   enemiesKilled: number;
+  rangedHits: number;
+  chargerHits: number;
 }
 
 export interface Rule {
@@ -14,6 +16,8 @@ export interface Rule {
   description: string;
   reason: string;
   iconName: string;
+  aiType: "PATCH" | "GLITCH";
+  dialogue: string;
 }
 
 export interface PlayerState {
@@ -35,7 +39,7 @@ export interface PlayerState {
   shieldCooldownTimer: number; // recharge cooldown
 }
 
-export type EnemyType = "walker" | "charger" | "shooter" | "scout";
+export type EnemyType = "walker" | "charger" | "shooter" | "scout" | "boss" | "gatekeeper";
 
 export interface EnemyState {
   id: string;
@@ -68,6 +72,7 @@ export interface ProjectileState {
   bounceCount: number;
   scale: number;
   color: string;
+  homing?: boolean;
 }
 
 export interface ParticleState {

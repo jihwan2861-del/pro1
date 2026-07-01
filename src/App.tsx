@@ -13,16 +13,17 @@ import {
 } from "./components/SoundEffects";
 import { motion, AnimatePresence } from "motion/react";
 
-type GameScreen = "TITLE" | "PLAYING" | "ANALYZING" | "GAMEOVER";
+type GameScreen = "TITLE" | "PLAYING" | "ANALYZING" | "GAMEOVER" | "GAMECLEAR";
 
 export default function App() {
   const [screen, setScreen] = useState<GameScreen>("TITLE");
-  const [round, setRound] = useState(1);
+  const [round, setRound] = useState(1); // Treats round as stage (1 to 7)
   const [activeRules, setActiveRules] = useState<Rule[]>([]);
   const [roundStats, setRoundStats] = useState<GameStats | null>(null);
   const [gameStatsHistory, setGameStatsHistory] = useState<GameStats[]>([]);
   const [playerMaxHp, setPlayerMaxHp] = useState(3);
   const [soundOn, setSoundOn] = useState(true);
+  const [retryCount, setRetryCount] = useState(0); // For Stage 4 calibration
 
   // Sync sound setting
   useEffect(() => {
@@ -35,6 +36,7 @@ export default function App() {
     setRoundStats(null);
     setGameStatsHistory([]);
     setPlayerMaxHp(3);
+    setRetryCount(0);
     setScreen("PLAYING");
     if (soundOn) playAlert();
   };
@@ -42,19 +44,33 @@ export default function App() {
   const handleRoundCleared = (stats: GameStats) => {
     setRoundStats(stats);
     setGameStatsHistory(prev => [...prev, stats]);
-    setScreen("ANALYZING");
+    if (round === 7) {
+      setScreen("GAMECLEAR");
+      if (soundOn) playPatchApplied();
+    } else {
+      setScreen("ANALYZING");
+    }
   };
 
   const handleApplyPatch = (newRule: Rule) => {
-    // Add rule
-    setActiveRules(prev => [...prev, newRule]);
-    
-    // Check if player hp is reduced by rule
-    if (newRule.id === "PLAYER_HP_DOWN") {
-      setPlayerMaxHp(prev => Math.max(1, prev - 1));
+    if (newRule && newRule.id) {
+      setActiveRules(prev => [...prev, newRule]);
+      if (newRule.id === "PLAYER_HP_DOWN") {
+        setPlayerMaxHp(prev => Math.max(1, prev - 1));
+      }
     }
+    setRetryCount(0); // reset retry count for next stage
+    setRound(prev => prev + 1);
+    setScreen("PLAYING");
+    if (soundOn) playAlert();
+  };
 
-    // Go to next round
+  const handleRemovePatch = (ruleId: string) => {
+    setActiveRules(prev => prev.filter(r => r.id !== ruleId));
+    if (ruleId === "PLAYER_HP_DOWN") {
+      setPlayerMaxHp(prev => prev + 1);
+    }
+    setRetryCount(0); // reset retry count for next stage
     setRound(prev => prev + 1);
     setScreen("PLAYING");
     if (soundOn) playAlert();
@@ -62,9 +78,14 @@ export default function App() {
 
   const handlePlayerDied = (stats: GameStats) => {
     setRoundStats(stats);
-    setGameStatsHistory(prev => [...prev, stats]);
     setScreen("GAMEOVER");
     if (soundOn) playGameOver();
+  };
+
+  const handleRetryStage = () => {
+    setRetryCount(prev => prev + 1);
+    setScreen("PLAYING");
+    if (soundOn) playAlert();
   };
 
   // Convert rule IDs to futuristic filename hashes
@@ -289,6 +310,7 @@ export default function App() {
                   playerMaxHp={playerMaxHp}
                   isPlaying={true}
                   soundEnabled={soundOn}
+                  retryCount={retryCount}
                 />
               </motion.div>
             )}
@@ -306,8 +328,10 @@ export default function App() {
                   round={round}
                   activeRules={activeRules}
                   onApplyPatch={handleApplyPatch}
+                  onRemovePatch={handleRemovePatch}
                   soundEnabled={soundOn}
                   onToggleSound={toggleSound}
+                  retryCount={retryCount}
                 />
               </motion.div>
             )}
@@ -339,8 +363,8 @@ export default function App() {
 
                   <div className="grid grid-cols-2 gap-4 text-xs">
                     <div className="space-y-1">
-                      <div className="text-gray-500 uppercase tracking-tight text-[10px]">ROUNDS ACCOMPLISHED</div>
-                      <div className="text-white font-bold text-lg">{round}</div>
+                      <div className="text-gray-500 uppercase tracking-tight text-[10px]">STAGE FAILED</div>
+                      <div className="text-white font-bold text-lg">STAGE {round}</div>
                     </div>
                     <div className="space-y-1">
                       <div className="text-gray-500 uppercase tracking-tight text-[10px]">TOTAL TARGET PURGES</div>
@@ -353,7 +377,7 @@ export default function App() {
                     <div className="space-y-1">
                       <div className="text-gray-500 uppercase tracking-tight text-[10px]">CALIBRATION ACCELERATION</div>
                       <div className="text-cyber-yellow font-bold text-lg">
-                        {round > 8 ? "IMPOSSIBLE" : round > 5 ? "MAX_PRESSURE" : "EXPERIMENTAL"}
+                        {round > 5 ? "MAX_PRESSURE" : "EXPERIMENTAL"}
                       </div>
                     </div>
                   </div>
@@ -361,7 +385,127 @@ export default function App() {
                   <div className="border-t border-cyber-green/10 pt-3">
                     <span className="text-[10px] text-gray-500 font-bold tracking-widest uppercase block mb-1">AI REMARKS:</span>
                     <p className="text-xs text-gray-300 italic leading-relaxed font-sans">
-                      "Thank you for helping improve the game. Your motor-reflex statistics have been fully harvested to build more optimal experiences. Rebooting terminal recommended."
+                      "시스템 최적화를 포기하지 마세요. 스테이지 백업 데이터로부터 복구(RETRY)하거나 커널을 전면 초기화(REBOOT)할 수 있습니다."
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex gap-4 mt-8">
+                  <motion.button
+                    whileHover={{ scale: 1.05 }}
+                    whileTap={{ scale: 0.98 }}
+                    onClick={handleRetryStage}
+                    className="px-6 py-3.5 bg-cyber-green text-black font-bold hover:bg-white hover:text-black transition-colors cursor-pointer text-xs font-mono tracking-wider uppercase rounded-none"
+                  >
+                    <RefreshCw className="w-4 h-4 animate-spin-slow inline mr-2" />
+                    <span>RETRY_STAGE.EXE</span>
+                  </motion.button>
+                  
+                  <motion.button
+                    whileHover={{ scale: 1.05 }}
+                    whileTap={{ scale: 0.98 }}
+                    onClick={handleStartGame}
+                    className="px-6 py-3.5 bg-cyber-red text-white font-bold hover:bg-white hover:text-black transition-colors cursor-pointer text-xs font-mono tracking-wider uppercase rounded-none"
+                  >
+                    <Trash2 className="w-4 h-4 inline mr-2" />
+                    <span>REBOOT_SYS.EXE</span>
+                  </motion.button>
+                </div>
+              </motion.div>
+            )}
+
+            {screen === "GAMECLEAR" && (
+              <motion.div
+                key="gameclear"
+                initial={{ opacity: 0, scale: 0.98 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0 }}
+                className="w-full h-full bg-black/95 border border-cyber-green/50 rounded-none p-8 flex flex-col justify-center items-center font-mono relative crt-screen scanline shadow-2xl"
+              >
+                <div className="mb-4 p-3 bg-cyber-green/10 border border-cyber-green/30 rounded-none text-cyber-green shadow-[0_0_15px_rgba(0,255,65,0.2)] animate-pulse">
+                  <Sparkles className="w-8 h-8 glow-green" />
+                </div>
+
+                <h2 className="text-4xl font-black font-mono tracking-tight text-cyber-green glow-green mb-2 uppercase">
+                  SYSTEM CLEAR
+                </h2>
+                <p className="text-xs text-cyber-green/60 uppercase tracking-widest mb-6">
+                  Kernel Optimization Fully Accomplished
+                </p>
+
+                {/* Character split avatar panel using the characters.png split rendering */}
+                <div className="flex gap-6 items-center justify-center mb-6 w-full max-w-lg">
+                  {/* Patch */}
+                  <div className="flex flex-col items-center gap-2">
+                    <div style={{
+                      width: '90px',
+                      height: '110px',
+                      backgroundImage: 'url(/assets/characters.png)',
+                      backgroundSize: '200% 100%',
+                      backgroundPosition: 'left center',
+                      backgroundRepeat: 'no-repeat',
+                      border: '1px solid rgba(0, 255, 65, 0.3)',
+                    }} />
+                    <span className="text-[10px] text-cyber-green font-bold bg-cyber-green/10 px-2 py-0.5 border border-cyber-green/20">PATCH AI</span>
+                  </div>
+
+                  <div className="text-center font-sans text-xs max-w-xs text-gray-400 italic">
+                    "가상 서버 커널 테스트가 완벽하게 마무리되었습니다! 고생하셨어요, 테스터 님!"
+                  </div>
+
+                  {/* Glitch */}
+                  <div className="flex flex-col items-center gap-2">
+                    <div style={{
+                      width: '90px',
+                      height: '110px',
+                      backgroundImage: 'url(/assets/characters.png)',
+                      backgroundSize: '200% 100%',
+                      backgroundPosition: 'right center',
+                      backgroundRepeat: 'no-repeat',
+                      border: '1px solid rgba(255, 0, 85, 0.3)',
+                    }} />
+                    <span className="text-[10px] text-cyber-red font-bold bg-cyber-red/10 px-2 py-0.5 border border-cyber-red/20">GLITCH AI</span>
+                  </div>
+                </div>
+
+                <div className="w-full max-w-lg bg-black/95 border border-cyber-green/20 rounded-none p-6 space-y-4 text-left">
+                  <div className="text-xs font-bold text-cyber-green border-b border-cyber-green/10 pb-2 uppercase tracking-wider flex items-center justify-between">
+                    <span>FINAL SYSTEM DIAGNOSTIC REPORT</span>
+                    <span>SUCCESS_v1.0.0</span>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-4 text-xs">
+                    <div className="space-y-1">
+                      <div className="text-gray-500 uppercase tracking-tight text-[10px]">TOTAL STAGES COMPLETED</div>
+                      <div className="text-white font-bold text-lg">7 / 7 STAGES</div>
+                    </div>
+                    <div className="space-y-1">
+                      <div className="text-gray-500 uppercase tracking-tight text-[10px]">TOTAL BOTS PURGED</div>
+                      <div className="text-white font-bold text-lg">{getTotalKills()} bots</div>
+                    </div>
+                    <div className="space-y-1">
+                      <div className="text-gray-500 uppercase tracking-tight text-[10px]">AVERAGE TARGET ACCURACY</div>
+                      <div className="text-cyber-green font-bold text-lg">{getFinalAccuracy()}%</div>
+                    </div>
+                    <div className="space-y-1">
+                      <div className="text-gray-500 uppercase tracking-tight text-[10px]">FINAL EVALUATION GRADE</div>
+                      <div className="text-cyber-yellow font-bold text-2xl glow-yellow">
+                        {(() => {
+                          const acc = getFinalAccuracy();
+                          const kills = getTotalKills();
+                          if (acc >= 75 && kills >= 30) return "S [EXCELLENT]";
+                          if (acc >= 55) return "A [OPTIMIZED]";
+                          if (acc >= 35) return "B [STABLE]";
+                          return "C [UNSTABLE]";
+                        })()}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="border-t border-cyber-green/10 pt-3">
+                    <span className="text-[10px] text-gray-500 font-bold tracking-widest uppercase block mb-1">GLITCH'S COMPLAINT:</span>
+                    <p className="text-xs text-cyber-red/80 italic leading-relaxed font-sans font-medium">
+                      "쳇... 기어코 최적화 에러들을 다 뚫고 최종 코어까지 고장 내버리다니... 다음번 테스트에서는 두 배로 고생하게 만들 테니까 각오해두라고!"
                     </p>
                   </div>
                 </div>
@@ -370,10 +514,10 @@ export default function App() {
                   whileHover={{ scale: 1.05 }}
                   whileTap={{ scale: 0.98 }}
                   onClick={handleStartGame}
-                  className="mt-8 px-8 py-3.5 bg-cyber-red text-white font-bold hover:bg-white hover:text-black transition-colors cursor-pointer text-xs font-mono tracking-wider uppercase rounded-none"
+                  className="mt-8 px-8 py-3.5 bg-cyber-green text-black font-bold hover:bg-white hover:text-black transition-colors cursor-pointer text-xs font-mono tracking-wider uppercase rounded-none"
                 >
                   <RefreshCw className="w-4 h-4 animate-spin-slow inline mr-2" />
-                  <span>REBOOT_SYS.EXE</span>
+                  <span>SYSTEM_REBOOT.EXE</span>
                 </motion.button>
               </motion.div>
             )}

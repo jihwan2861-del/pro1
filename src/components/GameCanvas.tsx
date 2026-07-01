@@ -17,6 +17,7 @@ interface GameCanvasProps {
   playerMaxHp: number;
   isPlaying: boolean;
   soundEnabled: boolean;
+  retryCount: number;
 }
 
 export default function GameCanvas({
@@ -27,6 +28,7 @@ export default function GameCanvas({
   playerMaxHp,
   isPlaying,
   soundEnabled,
+  retryCount,
 }: GameCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -77,6 +79,18 @@ export default function GameCanvas({
   const statsDamageDealt = useRef(0);
   const statsDamageTaken = useRef(0);
   const statsDashCount = useRef(0);
+  const statsRangedHits = useRef(0);
+  const statsChargerHits = useRef(0);
+
+  // New rule-specific refs
+  const hasUsedUrgentHeal = useRef(false);
+  const shieldHp = useRef(0);
+  const lastDamageTimer = useRef(0);
+  const playerShotsCount = useRef(0);
+
+  // Invulnerability and Laser sweeping states
+  const playerInvulnTimer = useRef(0);
+  const laserAngle = useRef(0);
 
   // HUD visual feedback state (React mirroring for instant overlay feedback)
   const [playerHp, setPlayerHp] = useState(playerMaxHp);
@@ -92,6 +106,95 @@ export default function GameCanvas({
   const burstTimer = useRef(0);
   const burstShotsLeft = useRef(0);
   const lastShotTime = useRef(0);
+
+  // Distance from point (px, py) to line segment from (x1, y1) to (x2, y2)
+  const distToSegment = (px: number, py: number, x1: number, y1: number, x2: number, y2: number) => {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const lenSq = dx * dx + dy * dy;
+    if (lenSq === 0) return Math.sqrt((px - x1) ** 2 + (py - y1) ** 2);
+    
+    let t = ((px - x1) * dx + (py - y1) * dy) / lenSq;
+    t = Math.max(0, Math.min(1, t));
+    
+    const projX = x1 + t * dx;
+    const projY = y1 + t * dy;
+    return Math.sqrt((px - projX) ** 2 + (py - projY) ** 2);
+  };
+
+  // Central damage application helper
+  const applyDamageToPlayer = (dmg: number, source: string) => {
+    if (player.current.hp <= 0 || player.current.isDashing || playerInvulnTimer.current > 0) return;
+
+    if (source === "PROJECTILE" || source === "GATEKEEPER_LASER" || source === "FINAL_CORE_LASER") {
+      statsRangedHits.current++;
+    }
+    if (source === "CHARGER_CONTACT") {
+      statsChargerHits.current++;
+    }
+
+    // Reset last damage timer (for armor regen check)
+    lastDamageTimer.current = 0;
+
+    // Apply shieldHp layer (from ARMOR_REGEN) first
+    if (shieldHp.current > 0) {
+      shieldHp.current--;
+      if (soundEnabled) playShieldBreak();
+      addFloatingText(player.current.x, player.current.y - 15, `SHIELD BLOCK (${shieldHp.current})`, "#00ccff");
+      createExplosion(player.current.x, player.current.y, "#00ccff", 15);
+      return;
+    }
+    
+    if (player.current.shieldActive) {
+      player.current.shieldActive = false;
+      setShieldActive(false);
+      player.current.shieldCooldownTimer = 480; // 8 seconds recharge
+      if (soundEnabled) playShieldBreak();
+      addFloatingText(player.current.x, player.current.y - 15, "SHIELD BLOCK", "#00ccff");
+      createExplosion(player.current.x, player.current.y, "#00ccff", 15);
+    } else {
+      // Calculate damage modifiers (RANGED_DEFENSE, ENEMY_DAMAGE_AMP)
+      let finalDmg = dmg;
+      if (activeRules.some(r => r.id === "RANGED_DEFENSE") && 
+          (source === "PROJECTILE" || source === "GATEKEEPER_LASER" || source === "FINAL_CORE_LASER")) {
+        finalDmg = Math.max(0, finalDmg - 1);
+      }
+      if (activeRules.some(r => r.id === "ENEMY_DAMAGE_AMP")) {
+        finalDmg += 1;
+      }
+
+      player.current.hp = Math.max(0, player.current.hp - finalDmg);
+      setPlayerHp(player.current.hp);
+      statsDamageTaken.current += finalDmg;
+      if (soundEnabled) playPlayerHit();
+
+      addFloatingText(player.current.x, player.current.y - 15, `-${finalDmg} HP`, "#ff3366");
+      createExplosion(player.current.x, player.current.y, "#ff3366", 12);
+      
+      // Flash invulnerability frames (CHEAT_INVULN extends by 60 frames = 1s)
+      const extraInvuln = activeRules.some(r => r.id === "CHEAT_INVULN") ? 60 : 0;
+      playerInvulnTimer.current = 50 + extraInvuln; 
+    }
+
+    if (player.current.hp <= 0) {
+      roundActive.current = false;
+      createExplosion(player.current.x, player.current.y, "#ff3366", 40);
+      
+      setTimeout(() => {
+        onPlayerDied({
+          shotsFired: statsShotsFired.current,
+          shotsHit: statsShotsHit.current,
+          damageDealt: statsDamageDealt.current,
+          damageTaken: statsDamageTaken.current,
+          dashCount: statsDashCount.current,
+          timeElapsed: roundTime.current,
+          enemiesKilled: enemiesKilledInRound.current,
+          rangedHits: statsRangedHits.current,
+          chargerHits: statsChargerHits.current,
+        });
+      }, 1200);
+    }
+  };
 
   // Reset/Initialize Player for a Round or Game
   const initPlayer = () => {
@@ -115,6 +218,9 @@ export default function GameCanvas({
     player.current.dashCooldownTimer = 0;
     player.current.isDashing = false;
 
+    // Reset invulnerability
+    playerInvulnTimer.current = 0;
+
     // React state update
     setPlayerHp(player.current.hp);
     setShieldActive(player.current.shieldActive);
@@ -122,7 +228,10 @@ export default function GameCanvas({
 
   // Determine Wave Enemies Count
   const getWaveConfig = (r: number) => {
-    let baseCount = 4 + r * 2;
+    if (r === 4 || r === 7) {
+      return 1; // Only the Boss spawns
+    }
+    let baseCount = 3 + r * 2;
     // Rule: Double Enemy Wave Spawn
     if (activeRules.some(rule => rule.id === "DOUBLE_ENEMY")) {
       baseCount *= 2;
@@ -135,16 +244,19 @@ export default function GameCanvas({
     // Determine enemy specifications based on current round and rules
     const hasHpUpRule = activeRules.some(rule => rule.id === "ENEMY_HP_UP");
     const hasSpeedUpRule = activeRules.some(rule => rule.id === "ENEMY_SPEED_UP");
-    const hasShooters = activeRules.some(rule => rule.id === "FAST_SHOOTING_ENEMIES");
+    const hasHpBuffDebuff = activeRules.some(rule => rule.id === "ENEMY_HP_BUFF_DEBUFF");
 
     let hpMultiplier = hasHpUpRule ? 1.5 : 1.0;
+    if (hasHpBuffDebuff) hpMultiplier *= 1.3;
     let speedMultiplier = hasSpeedUpRule ? 1.25 : 1.0;
 
-    // Types of enemies: "walker" | "charger" | "shooter" | "scout"
-    // Walker: base follower, standard hp
-    // Charger: fast but low hp, rushes
-    // Shooter: stands back and shoots slow energy ball
-    // Scout: tiny, moves erratically, low damage
+    // Apply Stage 5 and Stage 6 global multipliers as per GDD
+    if (round === 5) {
+      hpMultiplier *= 1.5; // Stage 5: Enemies health buffed
+    }
+    if (round === 6) {
+      speedMultiplier *= 1.4; // Stage 6: Enemies speed buffed
+    }
 
     let type: EnemyType = "walker";
     let hp = 15 + round * 4;
@@ -153,36 +265,97 @@ export default function GameCanvas({
     let radius = 16;
     let color = "#00ff66"; // Neon Green walker
 
-    const rand = Math.random();
-    if (hasShooters && rand < 0.35) {
-      type = "shooter";
-      hp = 12 + round * 3;
-      speed = 1.2 + Math.min(round * 0.1, 0.8);
-      radius = 18;
-      color = "#00ccff"; // Neon Blue shooter
-    } else if (rand > 0.75) {
+    // Stage-specific 스폰 구성 (GDD 설계 반영)
+    if (round === 1) {
+      // Stage 1: Walker만 등장 (이속도 느리게 스펙 조절)
+      type = "walker";
+      hp = 12;
+      speed = 1.2;
+      color = "#00ff66";
+    } else if (round === 2) {
+      // Stage 2: 돌진형 적 추가 (Charger 위주 구성)
       type = "charger";
-      hp = 10 + round * 2;
-      speed = 2.6 + Math.min(round * 0.2, 1.5);
+      hp = 12;
+      speed = 2.4;
       radius = 14;
-      color = "#ff3366"; // Neon Pink/Red charger
-    } else if (rand > 0.6) {
-      type = "scout";
-      hp = 8 + round * 1;
-      speed = 2.2 + Math.min(round * 0.25, 1.4);
-      radius = 12;
-      color = "#ffcc00"; // Neon Yellow scout
+      color = "#ff3366";
+    } else if (round === 3) {
+      // Stage 3: 원거리 유도탄 적 추가 (Shooter 위주 구성)
+      type = "shooter";
+      hp = 18;
+      speed = 1.1;
+      radius = 18;
+      color = "#00ccff";
+    } else if (round === 4) {
+      // Stage 4: 중간 관리 게이트 (정지형 레이저 보스)
+      type = "gatekeeper";
+      hp = Math.round(200 / (1 + retryCount * 0.25)); // 리트라이 횟수에 따른 HP 감소
+      speed = 0;
+      radius = 32;
+      color = "#ffcc00";
+    } else if (round === 7) {
+      // Stage 7: 최종 보스 코어 등장
+      type = "boss";
+      hp = 500;
+      speed = 0.5;
+      radius = 45;
+      color = "#ff0055";
+    } else {
+      // 그 외 스테이지(5, 6): 혼합 몬스터 스폰
+      const rand = Math.random();
+      if (rand < 0.3) {
+        type = "shooter";
+        hp = 16 + round * 3;
+        speed = 1.2 + Math.min(round * 0.1, 0.8);
+        radius = 18;
+        color = "#00ccff";
+      } else if (rand > 0.7) {
+        type = "charger";
+        hp = 12 + round * 2;
+        speed = 2.6 + Math.min(round * 0.2, 1.5);
+        radius = 14;
+        color = "#ff3366";
+      } else if (rand > 0.5) {
+        type = "scout";
+        hp = 10 + round;
+        speed = 2.2 + Math.min(round * 0.25, 1.4);
+        radius = 12;
+        color = "#ffcc00";
+      } else {
+        type = "walker";
+        hp = 16 + round * 4;
+        speed = 1.6 + Math.min(round * 0.15, 1.2);
+        color = "#00ff66";
+      }
+    }
+
+    // Apply speed modifiers (적 기동성 향상, 돌격 프로토콜)
+    if (activeRules.some(r => r.id === "ENEMY_SPEED_UP_DEBUFF")) {
+      speed += 1.0;
+    }
+    if (type === "charger" && activeRules.some(r => r.id === "CHARGER_BUFF")) {
+      speed += 2.0;
     }
 
     // Spawn at screen edges
     let x = 0;
     let y = 0;
-    if (Math.random() > 0.5) {
-      x = Math.random() > 0.5 ? -40 : logicalWidth + 40;
-      y = Math.random() * logicalHeight;
+    if (type === "gatekeeper") {
+      // Screen center-top for Gatekeeper
+      x = logicalWidth / 2;
+      y = logicalHeight / 2 - 120;
+    } else if (type === "boss") {
+      // Screen center for Final Boss Core
+      x = logicalWidth / 2;
+      y = logicalHeight / 2;
     } else {
-      x = Math.random() * logicalWidth;
-      y = Math.random() > 0.5 ? -40 : logicalHeight + 40;
+      if (Math.random() > 0.5) {
+        x = Math.random() > 0.5 ? -40 : logicalWidth + 40;
+        y = Math.random() * logicalHeight;
+      } else {
+        x = Math.random() * logicalWidth;
+        y = Math.random() > 0.5 ? -40 : logicalHeight + 40;
+      }
     }
 
     const newEnemy: EnemyState = {
@@ -199,7 +372,7 @@ export default function GameCanvas({
       type,
       color,
       flashTimer: 0,
-      shootTimer: Math.random() * 120 + 60, // random start offset for shooters
+      shootTimer: Math.random() * 80 + 40,
       knockbackX: 0,
       knockbackY: 0,
     };
@@ -227,6 +400,13 @@ export default function GameCanvas({
     statsDamageDealt.current = 0;
     statsDamageTaken.current = 0;
     statsDashCount.current = 0;
+    statsRangedHits.current = 0;
+    statsChargerHits.current = 0;
+
+    hasUsedUrgentHeal.current = false;
+    shieldHp.current = 0;
+    lastDamageTimer.current = 0;
+    playerShotsCount.current = 0;
 
     initPlayer();
 
@@ -259,6 +439,10 @@ export default function GameCanvas({
     const vx = Math.cos(angle) * baseSpeed;
     const vy = Math.sin(angle) * baseSpeed;
 
+    playerShotsCount.current++;
+    const hasAimAssist = activeRules.some(r => r.id === "AIM_ASSIST");
+    const isHoming = hasAimAssist && (playerShotsCount.current % 2 === 0);
+
     const newBullet: ProjectileState = {
       id: Math.random().toString(),
       x: player.current.x + Math.cos(angle) * player.current.radius,
@@ -270,7 +454,8 @@ export default function GameCanvas({
       isEnemy: false,
       bounceCount: hasBouncing ? 1 : 0,
       scale: 1.0,
-      color: "#00ff66", // bright green player laser tracer
+      color: isHoming ? "#00ffff" : "#00ff66", // Homing bullets are cyan colored
+      homing: isHoming,
     };
 
     projectiles.current.push(newBullet);
@@ -436,6 +621,8 @@ export default function GameCanvas({
               dashCount: statsDashCount.current,
               timeElapsed: roundTime.current,
               enemiesKilled: enemiesKilledInRound.current,
+              rangedHits: statsRangedHits.current,
+              chargerHits: statsChargerHits.current,
             };
             onRoundCleared(calculatedStats);
           }, 1500);
@@ -449,6 +636,33 @@ export default function GameCanvas({
           player.current.shieldActive = true;
           setShieldActive(true);
           createExplosion(player.current.x, player.current.y, "#00ccff", 8);
+        }
+      }
+
+      // 2.2. Urgent protection protocol (URGENT_HEAL)
+      const hasUrgentHeal = activeRules.some(r => r.id === "URGENT_HEAL");
+      if (hasUrgentHeal && !hasUsedUrgentHeal.current && player.current.hp > 0 && player.current.hp < player.current.maxHp * 0.5) {
+        hasUsedUrgentHeal.current = true;
+        const healAmt = Math.round(player.current.maxHp * 0.3);
+        player.current.hp = Math.min(player.current.maxHp, player.current.hp + healAmt);
+        setPlayerHp(player.current.hp);
+        if (soundEnabled) playShieldBreak();
+        addFloatingText(player.current.x, player.current.y - 15, `EMERGENCY HEAL +${healAmt}`, "#00ff66");
+        createExplosion(player.current.x, player.current.y, "#00ff66", 18);
+      }
+
+      // 2.5. Armor regen protocol (ARMOR_REGEN)
+      const hasArmorRegen = activeRules.some(r => r.id === "ARMOR_REGEN");
+      if (hasArmorRegen && player.current.hp > 0) {
+        lastDamageTimer.current++;
+        if (lastDamageTimer.current >= 300) { // 5 seconds at 60 FPS
+          if (shieldHp.current < 3) {
+            shieldHp.current++;
+            if (soundEnabled) playShieldBreak();
+            addFloatingText(player.current.x, player.current.y - 15, `SHIELD CHARGED (${shieldHp.current}/3)`, "#00ccff");
+            createExplosion(player.current.x, player.current.y, "#00ccff", 8);
+          }
+          lastDamageTimer.current = 0; // reset
         }
       }
 
@@ -471,6 +685,8 @@ export default function GameCanvas({
       const hasPlayerSpeedUp = activeRules.some(r => r.id === "PLAYER_SPEED_UP");
       let baseSpeed = player.current.speed;
       if (hasPlayerSpeedUp) baseSpeed *= 1.25;
+      if (activeRules.some(r => r.id === "SPEED_UP_BUFF")) baseSpeed += 1.0;
+      if (activeRules.some(r => r.id === "ADRENALINE") && isMouseDown.current) baseSpeed += 0.8;
 
       if (player.current.isDashing) {
         player.current.dashTimer--;
@@ -517,7 +733,8 @@ export default function GameCanvas({
       // 4. Shoots trigger logic with optional Burst fire rule
       const hasBurstFire = activeRules.some(r => r.id === "BURST_FIRE");
       const currentTime = Date.now();
-      const firingInterval = 250; // ms standard ref cooldown
+      const hasFireRateUp = activeRules.some(r => r.id === "FIRE_RATE_UP");
+      const firingInterval = hasFireRateUp ? 212 : 250; // ms standard ref cooldown
 
       if (isMouseDown.current) {
         if (hasBurstFire) {
@@ -570,8 +787,22 @@ export default function GameCanvas({
         let trackingVy = 0;
 
         if (dist > 0) {
-          // Stand back slightly if shooter enemy
-          if (enemy.type === "shooter" && dist < 240) {
+          if (enemy.type === "gatekeeper") {
+            // Gatekeeper is static, doesn't move
+            trackingVx = 0;
+            trackingVy = 0;
+          } else if (enemy.type === "boss") {
+            // Final Boss core slowly drifts to center or player
+            const targetX = dist > 350 ? player.current.x : logicalWidth / 2;
+            const targetY = dist > 350 ? player.current.y : logicalHeight / 2;
+            const bdx = targetX - enemy.x;
+            const bdy = targetY - enemy.y;
+            const bdist = Math.sqrt(bdx * bdx + bdy * bdy);
+            if (bdist > 0) {
+              trackingVx = (bdx / bdist) * enemy.speed;
+              trackingVy = (bdy / bdist) * enemy.speed;
+            }
+          } else if (enemy.type === "shooter" && dist < 240) {
             // Shooters try to retreat slightly or circle around the player
             trackingVx = (-edx / dist) * enemy.speed * 0.6;
             trackingVy = (-edy / dist) * enemy.speed * 0.6;
@@ -596,12 +827,14 @@ export default function GameCanvas({
         enemy.x = Math.max(margin + enemy.radius, Math.min(logicalWidth - margin - enemy.radius, enemy.x));
         enemy.y = Math.max(margin + enemy.radius, Math.min(logicalHeight - margin - enemy.radius, enemy.y));
 
-        // Shooters fire orbs logic
-        if (enemy.type === "shooter" && player.current.hp > 0) {
+        // Shooters and Bosses fire orbs logic
+        if (player.current.hp > 0) {
           enemy.shootTimer--;
-          if (enemy.shootTimer <= 0) {
-            enemy.shootTimer = 110 + Math.random() * 50; // reset
-            // Shoot slow projectile
+
+          if (enemy.type === "shooter" && enemy.shootTimer <= 0) {
+            const baseTimer = 110 + Math.random() * 50;
+            const hasShooterBuff = activeRules.some(r => r.id === "SHOOTER_BUFF");
+            enemy.shootTimer = hasShooterBuff ? Math.round(baseTimer * 0.8) : baseTimer;
             const sAngle = Math.atan2(edy, edx);
             const bulletSpeed = 2.8;
             projectiles.current.push({
@@ -615,13 +848,141 @@ export default function GameCanvas({
               isEnemy: true,
               bounceCount: 0,
               scale: 1.0,
-              color: "#00ccff", // cyan blue glowing enemy tracking ball
+              color: round === 3 ? "#ff3366" : "#00ccff", // Stage 3 uses red/pink for homing warning
+              homing: round === 3, // Stage 3 Shooter bullets are homing!
             });
             if (soundEnabled) playEnemyShoot();
 
-            // Muzzle flash for enemy
             for (let k = 0; k < 2; k++) {
-              createParticle(enemy.x, enemy.y, Math.cos(sAngle)*2 + (Math.random()-0.5), Math.sin(sAngle)*2 + (Math.random()-0.5), 2.5, "#00ccff", 0.8, 12);
+              createParticle(enemy.x, enemy.y, Math.cos(sAngle) * 2 + (Math.random() - 0.5), Math.sin(sAngle) * 2 + (Math.random() - 0.5), 2.5, round === 3 ? "#ff3366" : "#00ccff", 0.8, 12);
+            }
+          } else if (enemy.type === "gatekeeper" && enemy.shootTimer <= 0) {
+            // Stage 4 Gatekeeper: 3-way spread shots
+            enemy.shootTimer = 90 + (retryCount * 15); // Shoots slower as retry count increases
+            const sAngle = Math.atan2(edy, edx);
+            const bulletSpeed = 3.0;
+            for (let k = -1; k <= 1; k++) {
+              const angle = sAngle + k * 0.25;
+              projectiles.current.push({
+                id: Math.random().toString(),
+                x: enemy.x + Math.cos(angle) * (enemy.radius + 5),
+                y: enemy.y + Math.sin(angle) * (enemy.radius + 5),
+                vx: Math.cos(angle) * bulletSpeed,
+                vy: Math.sin(angle) * bulletSpeed,
+                radius: 7.0,
+                damage: 1,
+                isEnemy: true,
+                bounceCount: 0,
+                scale: 1.0,
+                color: "#ffcc00",
+              });
+            }
+            if (soundEnabled) playEnemyShoot();
+          } else if (enemy.type === "boss") {
+            // Stage 7 Final Boss multi-phase logic
+            if (enemy.hp > 350) {
+              // Phase 1: Radial Rings
+              if (enemy.shootTimer <= 0) {
+                enemy.shootTimer = 85;
+                const numBullets = 16;
+                for (let k = 0; k < numBullets; k++) {
+                  const angle = (k / numBullets) * Math.PI * 2;
+                  projectiles.current.push({
+                    id: Math.random().toString(),
+                    x: enemy.x,
+                    y: enemy.y,
+                    vx: Math.cos(angle) * 3.4,
+                    vy: Math.sin(angle) * 3.4,
+                    radius: 6.5,
+                    damage: 1,
+                    isEnemy: true,
+                    bounceCount: 0,
+                    scale: 1.0,
+                    color: "#ff0055",
+                  });
+                }
+                if (soundEnabled) playEnemyShoot();
+              }
+            } else if (enemy.hp > 150) {
+              // Phase 2: Double Spiral Rain
+              if (Math.floor(roundTime.current * 60) % 2 === 0) {
+                const angle = (roundTime.current * 4.8) % (Math.PI * 2);
+                projectiles.current.push({
+                  id: Math.random().toString(),
+                  x: enemy.x,
+                  y: enemy.y,
+                  vx: Math.cos(angle) * 4.0,
+                  vy: Math.sin(angle) * 4.0,
+                  radius: 5.5,
+                  damage: 1,
+                  isEnemy: true,
+                  bounceCount: 0,
+                  scale: 1.0,
+                  color: "#ff3366",
+                });
+                const oppAngle = angle + Math.PI;
+                projectiles.current.push({
+                  id: Math.random().toString(),
+                  x: enemy.x,
+                  y: enemy.y,
+                  vx: Math.cos(oppAngle) * 4.0,
+                  vy: Math.sin(oppAngle) * 4.0,
+                  radius: 5.5,
+                  damage: 1,
+                  isEnemy: true,
+                  bounceCount: 0,
+                  scale: 1.0,
+                  color: "#ff3366",
+                });
+                if (soundEnabled && Math.random() < 0.1) playEnemyShoot();
+              }
+            } else {
+              // Phase 3: Targeted 3-way shots & Spawns
+              if (enemy.shootTimer <= 0) {
+                enemy.shootTimer = 30;
+                const sAngle = Math.atan2(edy, edx);
+                const bulletSpeed = 4.2;
+                for (let k = -1; k <= 1; k++) {
+                  const angle = sAngle + k * 0.22;
+                  projectiles.current.push({
+                    id: Math.random().toString(),
+                    x: enemy.x,
+                    y: enemy.y,
+                    vx: Math.cos(angle) * bulletSpeed,
+                    vy: Math.sin(angle) * bulletSpeed,
+                    radius: 7.0,
+                    damage: 1,
+                    isEnemy: true,
+                    bounceCount: 0,
+                    scale: 1.0,
+                    color: "#ffcc00",
+                  });
+                }
+                if (soundEnabled) playEnemyShoot();
+              }
+
+              // Spawn walkers every 180 frames (3 seconds)
+              if (Math.floor(roundTime.current * 60) % 180 === 0 && enemies.current.length < 5) {
+                enemies.current.push({
+                  id: Math.random().toString(),
+                  x: enemy.x + (Math.random() - 0.5) * 120,
+                  y: enemy.y + (Math.random() - 0.5) * 120,
+                  vx: 0,
+                  vy: 0,
+                  radius: 12,
+                  hp: 25,
+                  maxHp: 25,
+                  speed: 2.1,
+                  damage: 1,
+                  type: "walker",
+                  color: "#ff3366",
+                  flashTimer: 0,
+                  shootTimer: 999,
+                  knockbackX: 0,
+                  knockbackY: 0,
+                });
+                createExplosion(enemy.x, enemy.y, "#ff3366", 8);
+              }
             }
           }
         }
@@ -647,59 +1008,16 @@ export default function GameCanvas({
         // Contact damage trigger (Player vs Enemy)
         const pDist = Math.sqrt((enemy.x - player.current.x) ** 2 + (enemy.y - player.current.y) ** 2);
         if (pDist < enemy.radius + player.current.radius && player.current.hp > 0) {
-          // If player is actively dashing, they gain frame invincibility!
-          if (!player.current.isDashing) {
-            let dmg = enemy.damage;
+          if (!player.current.isDashing && playerInvulnTimer.current <= 0) {
+            applyDamageToPlayer(enemy.damage, enemy.type === "charger" ? "CHARGER_CONTACT" : "CONTACT");
 
-            // Resolve contact knockback
+            // Push player and enemy back
             const pushAngle = Math.atan2(player.current.y - enemy.y, player.current.x - enemy.x);
-            
-            if (player.current.shieldActive) {
-              // Shield absorbs the complete hit!
-              player.current.shieldActive = false;
-              setShieldActive(false);
-              player.current.shieldCooldownTimer = 480; // 8 seconds recharge at 60 FPS
-              if (soundEnabled) playShieldBreak();
-              
-              addFloatingText(player.current.x, player.current.y - 15, "SHIELD BLOCK", "#00ccff");
-              createExplosion(player.current.x, player.current.y, "#00ccff", 15);
-            } else {
-              // Deduct health
-              player.current.hp = Math.max(0, player.current.hp - dmg);
-              setPlayerHp(player.current.hp);
-              statsDamageTaken.current += dmg;
-              if (soundEnabled) playPlayerHit();
+            player.current.x += Math.cos(pushAngle) * 15;
+            player.current.y += Math.sin(pushAngle) * 15;
 
-              addFloatingText(player.current.x, player.current.y - 15, `-${dmg} HP`, "#ff3366");
-              createExplosion(player.current.x, player.current.y, "#ff3366", 12);
-
-              // Push back slightly
-              player.current.x += Math.cos(pushAngle) * 20;
-              player.current.y += Math.sin(pushAngle) * 20;
-            }
-
-            // Push enemy back too
             enemy.knockbackX = -Math.cos(pushAngle) * 6;
             enemy.knockbackY = -Math.sin(pushAngle) * 6;
-
-            // Player Game Over Check
-            if (player.current.hp <= 0) {
-              roundActive.current = false;
-              createExplosion(player.current.x, player.current.y, "#ff3366", 40);
-              
-              setTimeout(() => {
-                const finalStats: GameStats = {
-                  shotsFired: statsShotsFired.current,
-                  shotsHit: statsShotsHit.current,
-                  damageDealt: statsDamageDealt.current,
-                  damageTaken: statsDamageTaken.current,
-                  dashCount: statsDashCount.current,
-                  timeElapsed: roundTime.current,
-                  enemiesKilled: enemiesKilledInRound.current,
-                };
-                onPlayerDied(finalStats);
-              }, 1200);
-            }
           }
         }
       }
@@ -710,6 +1028,52 @@ export default function GameCanvas({
 
       for (let i = activeProjectiles.length - 1; i >= 0; i--) {
         const bullet = activeProjectiles[i];
+        
+        // Homing projectile steering towards player (for Stage 3)
+        if (bullet.isEnemy && bullet.homing && player.current.hp > 0) {
+          const hdx = player.current.x - bullet.x;
+          const hdy = player.current.y - bullet.y;
+          const hdist = Math.sqrt(hdx * hdx + hdy * hdy);
+          if (hdist > 0) {
+            const speed = Math.sqrt(bullet.vx * bullet.vx + bullet.vy * bullet.vy);
+            const targetVx = (hdx / hdist) * speed;
+            const targetVy = (hdy / hdist) * speed;
+            
+            // Steer bullet direction towards player smoothly
+            bullet.vx = bullet.vx * 0.965 + targetVx * 0.035;
+            bullet.vy = bullet.vy * 0.965 + targetVy * 0.035;
+          }
+        }
+
+        // Homing projectile steering towards closest enemy (for AIM_ASSIST)
+        if (!bullet.isEnemy && bullet.homing) {
+          let closestEnemy: EnemyState | null = null;
+          let minDist = 999999;
+          for (const enemy of activeEnemies) {
+            const edx = enemy.x - bullet.x;
+            const edy = enemy.y - bullet.y;
+            const dist = Math.sqrt(edx * edx + edy * edy);
+            if (dist < minDist) {
+              minDist = dist;
+              closestEnemy = enemy;
+            }
+          }
+          if (closestEnemy) {
+            const hdx = closestEnemy.x - bullet.x;
+            const hdy = closestEnemy.y - bullet.y;
+            const hdist = Math.sqrt(hdx * hdx + hdy * hdy);
+            if (hdist > 0) {
+              const speed = Math.sqrt(bullet.vx * bullet.vx + bullet.vy * bullet.vy);
+              const targetVx = (hdx / hdist) * speed;
+              const targetVy = (hdy / hdist) * speed;
+              
+              // Steer bullet direction towards closest enemy smoothly
+              bullet.vx = bullet.vx * 0.9 + targetVx * 0.1;
+              bullet.vy = bullet.vy * 0.9 + targetVy * 0.1;
+            }
+          }
+        }
+
         bullet.x += bullet.vx;
         bullet.y += bullet.vy;
 
@@ -743,40 +1107,8 @@ export default function GameCanvas({
           const pDist = Math.sqrt((bullet.x - player.current.x) ** 2 + (bullet.y - player.current.y) ** 2);
           if (pDist < bullet.radius + player.current.radius && player.current.hp > 0) {
             activeProjectiles.splice(i, 1); // delete
-
-            if (!player.current.isDashing) {
-              if (player.current.shieldActive) {
-                player.current.shieldActive = false;
-                setShieldActive(false);
-                player.current.shieldCooldownTimer = 480;
-                if (soundEnabled) playShieldBreak();
-                addFloatingText(player.current.x, player.current.y - 15, "SHIELD BLOCK", "#00ccff");
-                createExplosion(player.current.x, player.current.y, "#00ccff", 15);
-              } else {
-                player.current.hp = Math.max(0, player.current.hp - bullet.damage);
-                setPlayerHp(player.current.hp);
-                statsDamageTaken.current += bullet.damage;
-                if (soundEnabled) playPlayerHit();
-
-                addFloatingText(player.current.x, player.current.y - 15, `-${bullet.damage} HP`, "#ff3366");
-                createExplosion(player.current.x, player.current.y, "#ff3366", 12);
-              }
-
-              if (player.current.hp <= 0) {
-                roundActive.current = false;
-                createExplosion(player.current.x, player.current.y, "#ff3366", 40);
-                setTimeout(() => {
-                  onPlayerDied({
-                    shotsFired: statsShotsFired.current,
-                    shotsHit: statsShotsHit.current,
-                    damageDealt: statsDamageDealt.current,
-                    damageTaken: statsDamageTaken.current,
-                    dashCount: statsDashCount.current,
-                    timeElapsed: roundTime.current,
-                    enemiesKilled: enemiesKilledInRound.current,
-                  });
-                }, 1200);
-              }
+            if (!player.current.isDashing && playerInvulnTimer.current <= 0) {
+              applyDamageToPlayer(bullet.damage, "PROJECTILE");
             }
           }
         } else {
@@ -787,12 +1119,16 @@ export default function GameCanvas({
             const bDist = Math.sqrt((bullet.x - enemy.x) ** 2 + (bullet.y - enemy.y) ** 2);
             if (bDist < bullet.radius + enemy.radius) {
               hitMade = true;
-              enemy.hp -= bullet.damage;
+              
+              const hasDamageUp = activeRules.some(r => r.id === "DAMAGE_UP");
+              const dmgApplied = hasDamageUp ? Math.round(bullet.damage * 1.2) : bullet.damage;
+              
+              enemy.hp -= dmgApplied;
               enemy.flashTimer = 8; // Flash red for 8 frames
               statsShotsHit.current++;
-              statsDamageDealt.current += bullet.damage;
+              statsDamageDealt.current += dmgApplied;
 
-              addFloatingText(enemy.x, enemy.y - 12, `${bullet.damage}`, "#00ff66");
+              addFloatingText(enemy.x, enemy.y - 12, `${dmgApplied}`, "#00ff66");
 
               // Sound feedback
               if (soundEnabled) playHit();
@@ -847,6 +1183,47 @@ export default function GameCanvas({
         }
       }
 
+      // 7.5. Laser sweeps and collision calculations
+      if (playerInvulnTimer.current > 0) {
+        playerInvulnTimer.current--;
+      }
+
+      if (round === 4 && player.current.hp > 0 && !player.current.isDashing) {
+        laserAngle.current += 0.012 / (1 + retryCount * 0.22);
+        
+        // Find Gatekeeper boss
+        const boss = enemies.current.find(e => e.type === "gatekeeper");
+        if (boss && playerInvulnTimer.current <= 0) {
+          const l1x = boss.x + Math.cos(laserAngle.current) * 1200;
+          const l1y = boss.y + Math.sin(laserAngle.current) * 1200;
+          const l2x = boss.x - Math.cos(laserAngle.current) * 1200;
+          const l2y = boss.y - Math.sin(laserAngle.current) * 1200;
+          
+          const d1 = distToSegment(player.current.x, player.current.y, boss.x, boss.y, l1x, l1y);
+          const d2 = distToSegment(player.current.x, player.current.y, boss.x, boss.y, l2x, l2y);
+          
+          const collisionThreshold = player.current.radius + 3;
+          if (d1 < collisionThreshold || d2 < collisionThreshold) {
+            applyDamageToPlayer(1, "GATEKEEPER_LASER");
+          }
+        }
+      } else if (round === 7 && player.current.hp > 0 && !player.current.isDashing) {
+        // Stage 7: Sweeping laser during Phase 3 (HP <= 150)
+        const boss = enemies.current.find(e => e.type === "boss");
+        if (boss && boss.hp <= 150) {
+          laserAngle.current += 0.024; // Sweeps faster!
+          if (playerInvulnTimer.current <= 0) {
+            const lx = boss.x + Math.cos(laserAngle.current) * 1200;
+            const ly = boss.y + Math.sin(laserAngle.current) * 1200;
+            
+            const d = distToSegment(player.current.x, player.current.y, boss.x, boss.y, lx, ly);
+            if (d < player.current.radius + 3) {
+              applyDamageToPlayer(1, "FINAL_CORE_LASER");
+            }
+          }
+        }
+      }
+
       // 8. Visual canvas drawing logic
       const canvas = canvasRef.current;
       const ctx = canvas?.getContext("2d");
@@ -882,6 +1259,67 @@ export default function GameCanvas({
         ctx.lineWidth = 2;
         ctx.strokeRect(margin - 4, margin - 4, logicalWidth - margin * 2 + 8, logicalHeight - margin * 2 + 8);
 
+        // Draw Stage 4 Boss Lasers
+        if (round === 4) {
+          const boss = enemies.current.find(e => e.type === "gatekeeper");
+          if (boss) {
+            ctx.save();
+            const l1x = boss.x + Math.cos(laserAngle.current) * 1200;
+            const l1y = boss.y + Math.sin(laserAngle.current) * 1200;
+            const l2x = boss.x - Math.cos(laserAngle.current) * 1200;
+            const l2y = boss.y - Math.sin(laserAngle.current) * 1200;
+            
+            // Draw thick glowing back line
+            ctx.strokeStyle = "rgba(255, 0, 85, 0.22)";
+            ctx.lineWidth = 14;
+            ctx.beginPath();
+            ctx.moveTo(boss.x, boss.y);
+            ctx.lineTo(l1x, l1y);
+            ctx.moveTo(boss.x, boss.y);
+            ctx.lineTo(l2x, l2y);
+            ctx.stroke();
+
+            // Draw core thin bright line
+            ctx.strokeStyle = "#ffffff";
+            ctx.lineWidth = 3.5;
+            ctx.beginPath();
+            ctx.moveTo(boss.x, boss.y);
+            ctx.lineTo(l1x, l1y);
+            ctx.moveTo(boss.x, boss.y);
+            ctx.lineTo(l2x, l2y);
+            ctx.stroke();
+            
+            ctx.restore();
+          }
+        }
+        // Draw Stage 7 Boss Laser (Phase 3)
+        if (round === 7) {
+          const boss = enemies.current.find(e => e.type === "boss");
+          if (boss && boss.hp <= 150) {
+            ctx.save();
+            const lx = boss.x + Math.cos(laserAngle.current) * 1200;
+            const ly = boss.y + Math.sin(laserAngle.current) * 1200;
+            
+            // Draw thick glowing back line
+            ctx.strokeStyle = "rgba(255, 0, 85, 0.25)";
+            ctx.lineWidth = 16;
+            ctx.beginPath();
+            ctx.moveTo(boss.x, boss.y);
+            ctx.lineTo(lx, ly);
+            ctx.stroke();
+
+            // Draw core thin bright line
+            ctx.strokeStyle = "#ffffff";
+            ctx.lineWidth = 4.0;
+            ctx.beginPath();
+            ctx.moveTo(boss.x, boss.y);
+            ctx.lineTo(lx, ly);
+            ctx.stroke();
+            
+            ctx.restore();
+          }
+        }
+
         // Laser Sight rule visualization
         const hasLaserSight = activeRules.some(r => r.id === "LASER_SIGHT");
         if (hasLaserSight && player.current.hp > 0) {
@@ -915,13 +1353,20 @@ export default function GameCanvas({
         // Draw Projectiles (bullets)
         for (const b of projectiles.current) {
           ctx.save();
+          
+          // Draw high-performance glow ring
           ctx.fillStyle = b.color;
-          // Add neon outer blur glow
-          ctx.shadowColor = b.color;
-          ctx.shadowBlur = 8;
+          ctx.globalAlpha = 0.25;
+          ctx.beginPath();
+          ctx.arc(b.x, b.y, b.radius + 3.5, 0, Math.PI * 2);
+          ctx.fill();
+          
+          // Draw bullet core
+          ctx.globalAlpha = 1.0;
           ctx.beginPath();
           ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
           ctx.fill();
+          
           ctx.restore();
         }
 
@@ -933,14 +1378,10 @@ export default function GameCanvas({
           if (enemy.flashTimer > 0) {
             ctx.fillStyle = "#ffffff";
             ctx.strokeStyle = "#ff3366";
-            ctx.shadowColor = "#ffffff";
           } else {
             ctx.fillStyle = enemy.color;
             ctx.strokeStyle = "rgba(0, 0, 0, 0.3)";
-            ctx.shadowColor = enemy.color;
           }
-
-          ctx.shadowBlur = 4;
           
           // Draw geometric robotic insect shape instead of simple circles to represent SD enemies
           ctx.beginPath();
@@ -958,6 +1399,52 @@ export default function GameCanvas({
             ctx.closePath();
             ctx.fill();
             ctx.stroke();
+          } else if (enemy.type === "gatekeeper") {
+            // Massive golden hexagonal tower
+            ctx.beginPath();
+            const numSides = 6;
+            for (let k = 0; k < numSides; k++) {
+              const angle = (k / numSides) * Math.PI * 2 + roundTime.current * 0.4;
+              const px = enemy.x + Math.cos(angle) * enemy.radius;
+              const py = enemy.y + Math.sin(angle) * enemy.radius;
+              if (k === 0) ctx.moveTo(px, py);
+              else ctx.lineTo(px, py);
+            }
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+            
+            // Pulsing warning core
+            ctx.fillStyle = "rgba(255, 204, 0, 0.35)";
+            ctx.beginPath();
+            ctx.arc(enemy.x, enemy.y, enemy.radius * (0.45 + Math.sin(roundTime.current * 5) * 0.12), 0, Math.PI * 2);
+            ctx.fill();
+            
+            ctx.fillStyle = "#ffffff";
+            ctx.beginPath();
+            ctx.arc(enemy.x, enemy.y, 4, 0, Math.PI * 2);
+            ctx.fill();
+          } else if (enemy.type === "boss") {
+            // Pulsing Crimson Boss Core
+            ctx.beginPath();
+            ctx.arc(enemy.x, enemy.y, enemy.radius, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.stroke();
+            
+            // Outer rotating protection shields (visual only)
+            ctx.strokeStyle = "rgba(255, 0, 85, 0.65)";
+            ctx.lineWidth = 4;
+            ctx.setLineDash([15, 25]);
+            ctx.beginPath();
+            ctx.arc(enemy.x, enemy.y, enemy.radius + 15, roundTime.current * 1.5, roundTime.current * 1.5 + Math.PI * 2);
+            ctx.stroke();
+            ctx.setLineDash([]); // clear dash
+            
+            // Inner core details
+            ctx.fillStyle = "#ffffff";
+            ctx.beginPath();
+            ctx.arc(enemy.x, enemy.y, enemy.radius * 0.35, 0, Math.PI * 2);
+            ctx.fill();
           } else if (enemy.type === "shooter") {
             // Hexagonal turret-style bot
             ctx.arc(enemy.x, enemy.y, enemy.radius, 0, Math.PI * 2);
@@ -1020,30 +1507,42 @@ export default function GameCanvas({
         if (player.current.hp > 0) {
           ctx.save();
           
+          // Blinking transparency effect if player is invincible (post-hit)
+          if (playerInvulnTimer.current > 0 && Math.floor(playerInvulnTimer.current / 3) % 2 === 0) {
+            ctx.globalAlpha = 0.25;
+          }
+          
           // Outer digital engine shield if player shield is active
           if (player.current.shieldActive) {
-            ctx.strokeStyle = "rgba(0, 204, 255, 0.7)";
-            ctx.lineWidth = 2.5;
-            ctx.shadowColor = "#00ccff";
-            ctx.shadowBlur = 8;
+            // Draw glowing outer shield ring (high performance)
+            ctx.strokeStyle = "rgba(0, 204, 255, 0.2)";
+            ctx.lineWidth = 6;
             ctx.beginPath();
             ctx.arc(player.current.x, player.current.y, player.current.radius + 7, 0, Math.PI * 2);
             ctx.stroke();
-            ctx.shadowBlur = 0; // reset
+
+            ctx.strokeStyle = "rgba(0, 204, 255, 0.8)";
+            ctx.lineWidth = 2.0;
+            ctx.beginPath();
+            ctx.arc(player.current.x, player.current.y, player.current.radius + 7, 0, Math.PI * 2);
+            ctx.stroke();
           }
 
           // Player base body drawing: Cyber SD Hero
+          // Glow outline (high performance)
+          ctx.fillStyle = "rgba(0, 255, 102, 0.25)";
+          ctx.beginPath();
+          ctx.arc(player.current.x, player.current.y, player.current.radius + 4, 0, Math.PI * 2);
+          ctx.fill();
+
           ctx.fillStyle = "#00ff66"; // Core terminal green
           ctx.strokeStyle = "#0a0e14";
           ctx.lineWidth = 2;
-          ctx.shadowColor = "#00ff66";
-          ctx.shadowBlur = 10;
           
           ctx.beginPath();
           ctx.arc(player.current.x, player.current.y, player.current.radius, 0, Math.PI * 2);
           ctx.fill();
           ctx.stroke();
-          ctx.shadowBlur = 0; // reset
 
           // Cute glasses / Cyber goggles face detail facing mouse cursor
           const pAngle = player.current.angle;
@@ -1109,6 +1608,23 @@ export default function GameCanvas({
           ctx.fillRect(0, 0, logicalWidth, logicalHeight);
           
           ctx.restore();
+        }
+
+        // Rule BLACKOUT: Screen goes dark for 3 seconds every 15 seconds
+        const hasBlackout = activeRules.some(r => r.id === "BLACKOUT");
+        if (hasBlackout && player.current.hp > 0) {
+          const blackoutPeriod = Math.floor(roundTime.current) % 18;
+          if (blackoutPeriod >= 15) {
+            ctx.save();
+            ctx.fillStyle = "rgba(10, 14, 20, 0.95)"; // almost pitch black!
+            ctx.fillRect(margin, margin, logicalWidth - margin * 2, logicalHeight - margin * 2);
+            
+            ctx.fillStyle = "#ff3366";
+            ctx.font = "bold 18px 'JetBrains Mono', monospace";
+            ctx.textAlign = "center";
+            ctx.fillText("CRITICAL SYSTEM SHUTDOWN", logicalWidth / 2, logicalHeight / 2 - 20);
+            ctx.restore();
+          }
         }
       }
 
